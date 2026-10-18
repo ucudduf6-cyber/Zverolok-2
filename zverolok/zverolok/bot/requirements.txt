@@ -1,0 +1,4 @@
+aiogram==3.20.0.post0
+sqlalchemy[asyncio]==2.0.40
+asyncpg==0.30.0
+redis==5.2.1

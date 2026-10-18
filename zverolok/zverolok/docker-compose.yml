@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: zverolok
+      POSTGRES_USER: zverolok
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zverolok"]
+      interval: 5s
+      retries: 15
+  redis:
+    image: redis:7-alpine
+  api:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://zverolok:${DB_PASSWORD}@db:5432/zverolok
+      REDIS_URL: redis://redis:6379/0
+    ports: ["8000:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+  bot:
+    build: ./bot
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://zverolok:${DB_PASSWORD}@db:5432/zverolok
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+volumes:
+  pgdata:
