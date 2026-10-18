@@ -1,7 +1,7 @@
 import asyncio, json, os, secrets
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -15,6 +15,8 @@ from argon2.exceptions import VerifyMismatchError, VerificationError
 import jwt
 from pywebpush import webpush, WebPushException
 import redis.asyncio as redis
+import httpx
+import logging
 
 DB = os.environ['DATABASE_URL']
 SECRET = os.environ['JWT_SECRET']
@@ -68,6 +70,7 @@ async def lifespan(app):
     async with engine.begin() as conn:
         await conn.execute(text('CREATE EXTENSION IF NOT EXISTS postgis'))
         await conn.run_sync(Base.metadata.create_all)
+    await configure_telegram_webhook()
     yield
     await r.aclose()
 app=FastAPI(title='ЗвероЛок API',lifespan=lifespan)
@@ -157,7 +160,7 @@ async def notify(p:Pet):
             except Exception:pass
     for u in targets.values():
         if u.telegram_id:
-            await r.publish('telegram-alerts',json.dumps({'chat_id':u.telegram_id,'text':'⚠️ Внимание! В вашем районе потерялась собака.' if p.kind=='dog' and p.status=='lost' else body}))
+            await telegram_send(u.telegram_id, '⚠️ Внимание! В вашем районе потерялась собака.' if p.kind=='dog' and p.status=='lost' else body)
 @app.post('/api/pets',status_code=201)
 async def create_pet(body:PetInput,u:User=Depends(current),s:AsyncSession=Depends(db)):
     if body.kind not in ('cat','dog','other') or body.status not in ('lost','found'):raise HTTPException(422,'Invalid kind/status')
@@ -194,3 +197,105 @@ async def websocket(ws:WebSocket):
             if event['type']=='message':await ws.send_text(event['data'])
     except (WebSocketDisconnect,RuntimeError):pass
     finally:await pub.aclose()
+
+# Telegram webhook works inside this FastAPI service: no background worker or Redis
+# subscriber is needed to answer commands and deliver Telegram notifications.
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_WEBHOOK_SECRET = os.getenv('TELEGRAM_WEBHOOK_SECRET', '')
+TELEGRAM_API = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}'
+log = logging.getLogger('zverolok.telegram')
+
+async def telegram_call(method: str, payload: dict):
+    if not TELEGRAM_TOKEN:
+        log.warning('TELEGRAM_BOT_TOKEN is missing')
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.post(f'{TELEGRAM_API}/{method}', json=payload)
+            response.raise_for_status()
+            result = response.json()
+            if not result.get('ok'):
+                log.error('Telegram %s failed: %s', method, result.get('description'))
+            return result
+    except (httpx.HTTPError, ValueError) as exc:
+        log.error('Telegram %s request failed: %s', method, type(exc).__name__)
+        return None
+
+async def telegram_send(chat_id: int, message: str, location_button: bool = False):
+    data = {'chat_id': chat_id, 'text': message}
+    if location_button:
+        data['reply_markup'] = {'keyboard': [[{'text': '📍 Отправить геопозицию', 'request_location': True}]], 'resize_keyboard': True}
+    await telegram_call('sendMessage', data)
+
+async def configure_telegram_webhook():
+    if not TELEGRAM_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
+        log.warning('Telegram webhook disabled: set TELEGRAM_BOT_TOKEN and TELEGRAM_WEBHOOK_SECRET')
+        return
+    public_url = os.getenv('PUBLIC_API_URL', 'https://zverolok-api.onrender.com').rstrip('/')
+    result = await telegram_call('setWebhook', {
+        'url': public_url + '/telegram/webhook',
+        'secret_token': TELEGRAM_WEBHOOK_SECRET,
+        'allowed_updates': ['message'],
+        'drop_pending_updates': False,
+    })
+    if result and result.get('ok'):
+        log.info('Telegram webhook configured')
+
+@app.post('/telegram/webhook', include_in_schema=False)
+async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: str | None = Header(default=None)):
+    if not TELEGRAM_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(503, 'Telegram is not configured')
+    if not secrets.compare_digest(x_telegram_bot_api_secret_token or '', TELEGRAM_WEBHOOK_SECRET):
+        raise HTTPException(403, 'Forbidden')
+    update = await request.json()
+    message = update.get('message') or {}
+    chat = message.get('chat') or {}
+    sender = message.get('from') or {}
+    chat_id, telegram_id = chat.get('id'), sender.get('id')
+    if not chat_id or not telegram_id or chat.get('type') != 'private':
+        return {'ok': True}
+    command_text = (message.get('text') or '').strip()
+    command = command_text.split(maxsplit=1)[0].split('@')[0].lower() if command_text else ''
+    if command == '/start':
+        parts = command_text.split(maxsplit=1)
+        if len(parts) == 2:
+            async with Session.begin() as session:
+                row = (await session.execute(text('SELECT user_id FROM link_codes WHERE code=:code AND expires > now() FOR UPDATE'), {'code': parts[1]})).first()
+                if row:
+                    await session.execute(text('UPDATE users SET telegram_id=NULL WHERE telegram_id=:tg'), {'tg': telegram_id})
+                    await session.execute(text('UPDATE users SET telegram_id=:tg WHERE id=:uid'), {'tg': telegram_id, 'uid': row.user_id})
+                    await session.execute(text('DELETE FROM link_codes WHERE code=:code'), {'code': parts[1]})
+            await telegram_send(chat_id, '✅ Telegram привязан к ЗвероЛок!' if row else 'Ссылка истекла. Получите новую в профиле сайта.')
+        else:
+            await telegram_send(chat_id, '🐾 Привет! Это ЗвероЛок. Чтобы получать оповещения, привяжите Telegram в профиле сайта.\nКоманды: /start, /radius 5, /animals cat dog')
+        await telegram_send(chat_id, '📍 Отправьте свою геопозицию:', location_button=True)
+    elif 'location' in message:
+        loc = message['location']
+        async with Session.begin() as session:
+            result = await session.execute(text('UPDATE users SET lat=:lat, lon=:lon WHERE telegram_id=:tg RETURNING id'), {'lat': loc['latitude'], 'lon': loc['longitude'], 'tg': telegram_id})
+            linked = result.first() is not None
+        await telegram_send(chat_id, '✅ Геопозиция сохранена.' if linked else 'Сначала привяжите Telegram в профиле сайта.')
+    elif command == '/radius':
+        try:
+            radius = int(command_text.split()[1])
+            if not 1 <= radius <= 100:
+                raise ValueError()
+        except (ValueError, IndexError):
+            await telegram_send(chat_id, 'Используйте /radius 5 (от 1 до 100 км)')
+            return {'ok': True}
+        async with Session.begin() as session:
+            result = await session.execute(text('UPDATE users SET radius_km=:radius WHERE telegram_id=:tg RETURNING id'), {'radius': radius, 'tg': telegram_id})
+            linked = result.first() is not None
+        await telegram_send(chat_id, f'✅ Радиус: {radius} км.' if linked else 'Сначала привяжите Telegram.')
+    elif command == '/animals':
+        kinds = command_text.split()[1:]
+        if not kinds or not set(kinds) <= {'cat', 'dog', 'other'}:
+            await telegram_send(chat_id, 'Пример: /animals cat dog')
+            return {'ok': True}
+        async with Session.begin() as session:
+            result = await session.execute(text('UPDATE users SET kinds=:kinds WHERE telegram_id=:tg RETURNING id'), {'kinds': ','.join(kinds), 'tg': telegram_id})
+            linked = result.first() is not None
+        await telegram_send(chat_id, '✅ Виды животных обновлены.' if linked else 'Сначала привяжите Telegram.')
+    elif command:
+        await telegram_send(chat_id, '🐾 Команды: /start, /radius 5, /animals cat dog')
+    return {'ok': True}
