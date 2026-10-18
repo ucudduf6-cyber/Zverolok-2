@@ -19,6 +19,9 @@ import redis.asyncio as redis
 DB = os.environ['DATABASE_URL']
 SECRET = os.environ['JWT_SECRET']
 ORIGIN = os.environ.get('PUBLIC_ORIGIN', 'http://localhost:5173')
+DB = DB.replace("postgresql://", "postgresql+asyncpg://", 1)
+DB = DB.replace("postgres://", "postgresql+asyncpg://", 1)
+
 engine = create_async_engine(DB, pool_pre_ping=True)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 ph = PasswordHasher()
